@@ -370,7 +370,8 @@ static void startForestHomeWhenBridgeReady(id controller) {
             waitForBridge = nil;
             return;
         }
-        if (++attempts >= 10) {
+        // 森林首页 H5 Bridge 就绪较慢时（弱网/多账号切换后 H5 重建）最多等待 15 秒：30 次 × 500ms
+        if (++attempts >= 30) {
             objc_setAssociatedObject(currentController, ForestHomeStartKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             [AntForestManager.sharedInstance recordStage:@"收取 · 森林首页 H5 Bridge 等待超时"];
             waitForBridge = nil;
