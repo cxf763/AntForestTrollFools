@@ -11,6 +11,10 @@
 #import <objc/message.h>
 #import "Tool.h"
 
+@interface AntForestManager ()
+- (void)handleAccountChangedFromUserId:(NSString *)previousUserId;
+@end
+
 @implementation AntForestManager
 
 static AntForestManager *afm = nil;
@@ -64,6 +68,39 @@ static NSMutableDictionary<NSString *, NSNumber *> *lastAnimalCollectAttemptTime
 static NSMutableSet<NSString *> *shieldReportedFriendsInRound = nil;
 static NSMutableDictionary<NSString *, NSNumber *> *sShieldedFriendsExpireMs = nil;
 static NSMutableSet<NSString *> *sDoubleCollectCheckedUsers = nil;
+// 账号身份是否已由 H5 回包确认（用于多账号切换时避免用上一账号的缓存状态启动任务）
+static BOOL sAccountIdentityConfirmed = NO;
+static NSInteger sLaunchIdentityWaitCount = 0;
+static BOOL sLaunchIdentityWaitScheduled = NO;
+
+// 账号隔离：按当前登录账号拼接 NSUserDefaults 键。
+// 支付宝同一个 App 容器内的数据在"切换账号"时不会清空，插件此前的浇水次数、
+// 日志、今日/累计能量等全部使用固定键，导致第二个账号读到第一个账号的数据。
+static NSString *afAccountScopedDefaultsKey(NSString *baseKey, NSString *userId) {
+    return userId.length ? [NSString stringWithFormat:@"%@_%@", baseKey, userId] : baseKey;
+}
+
+static NSString *afCurrentAccountScopedKey(NSString *baseKey) {
+    // 直接读取持久化的当前账号，避免在单例初始化期间再访问 sharedInstance
+    NSString *userId = [[NSUserDefaults standardUserDefaults] stringForKey:@"lastKnownUserId"];
+    return afAccountScopedDefaultsKey(baseKey, userId);
+}
+
+static NSString *afLogRecordKeyForUserId(NSString *userId) {
+    return afAccountScopedDefaultsKey(@"logRecord", userId);
+}
+
+static NSArray<NSString *> *afLoadLogRecordsForUserId(NSString *userId) {
+    NSData *data = [[NSUserDefaults standardUserDefaults] objectForKey:afLogRecordKeyForUserId(userId)];
+    if (![data isKindOfClass:NSData.class]) return @[];
+    id obj = nil;
+    @try {
+        NSSet *classes = [NSSet setWithArray:@[NSDictionary.class, NSArray.class, NSString.class, NSNumber.class]];
+        obj = [NSKeyedUnarchiver unarchivedObjectOfClasses:classes fromData:data error:nil];
+        if (!obj) obj = [NSKeyedUnarchiver unarchiveObjectWithData:data];
+    } @catch (__unused NSException *e) {}
+    return [obj isKindOfClass:NSArray.class] ? (NSArray<NSString *> *)obj : @[];
+}
 
 static NSString *getTaskActiveStartTimeString(void) {
     NSString *t = AntForestManager.sharedInstance.rewardTaskStartTime;
@@ -220,19 +257,24 @@ static NSString *waterTodayKey(void) {
     return getCurrentDateString();
 }
 
+// 浇水次数必须按【当前登录账号 + 目标好友】隔离存储：
+// 支付宝的每日 3 次限额是"当前账号对某好友"的额度，同一台设备切换账号后，
+// 另一个账号给同一好友浇水不应被上一账号的本地计数拦截（否则会误报"今日已浇满 3 次，已跳过"）。
 static NSMutableDictionary<NSString *, NSNumber *> *waterDailyCounts(void) {
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
     NSString *today = waterTodayKey();
-    if (![[defaults stringForKey:@"waterDailyDate"] isEqualToString:today]) {
-        [defaults setObject:today forKey:@"waterDailyDate"];
-        [defaults setObject:@{} forKey:@"waterDailyCounts"];
+    NSString *dateKey = afCurrentAccountScopedKey(@"waterDailyDate");
+    NSString *countsKey = afCurrentAccountScopedKey(@"waterDailyCounts");
+    if (![[defaults stringForKey:dateKey] isEqualToString:today]) {
+        [defaults setObject:today forKey:dateKey];
+        [defaults setObject:@{} forKey:countsKey];
     }
-    NSDictionary *saved = [defaults dictionaryForKey:@"waterDailyCounts"] ?: @{};
+    NSDictionary *saved = [defaults dictionaryForKey:countsKey] ?: @{};
     return [saved mutableCopy];
 }
 
 static void saveWaterDailyCounts(NSDictionary *counts) {
-    [NSUserDefaults.standardUserDefaults setObject:counts forKey:@"waterDailyCounts"];
+    [NSUserDefaults.standardUserDefaults setObject:counts forKey:afCurrentAccountScopedKey(@"waterDailyCounts")];
 }
 
 static NSString *waterJSONString(id value) {
@@ -840,6 +882,20 @@ static NSInteger reviveDailyCount(void) {
 
 - (void)startLaunchWateringThenCollect {
     BOOL shouldCollect = self.enableAutoCollect;
+    // 多账号场景下，打开森林首页时账号身份可能尚未由 H5 回包确认；
+    // 若此时直接用上一账号的缓存启动浇水，会被误判为"今日已浇满"而全部跳过。
+    // 这里最多等待约 3 秒，等账号确认后再开始；超时则维持原有行为继续执行。
+    if (!sAccountIdentityConfirmed && sLaunchIdentityWaitCount < 6) {
+        if (!sLaunchIdentityWaitScheduled) {
+            sLaunchIdentityWaitCount++;
+            sLaunchIdentityWaitScheduled = YES;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                sLaunchIdentityWaitScheduled = NO;
+                [self startLaunchWateringThenCollect];
+            });
+        }
+        return;
+    }
     if (waterLaunchAttempted) {
         if (shouldCollect) [self autoCollectBubbles];
         return;
@@ -1264,12 +1320,12 @@ static dispatch_source_t sBackgroundPulseTimer = nil;
     NSString *today = getCurrentDateString();
     if (!today.length) return;
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    NSString *savedDate = [defaults stringForKey:@"todayCollectedEnergyDate"];
+    NSString *savedDate = [defaults stringForKey:afCurrentAccountScopedKey(@"todayCollectedEnergyDate")];
     if (!savedDate.length || ![savedDate isEqualToString:today]) {
-        BOOL hadEnergy = (self.todayCollectedEnergy != 0 || [defaults integerForKey:@"todayCollectedEnergy"] != 0);
+        BOOL hadEnergy = (self.todayCollectedEnergy != 0 || [defaults integerForKey:afCurrentAccountScopedKey(@"todayCollectedEnergy")] != 0);
         self.todayCollectedEnergy = 0;
-        [defaults setInteger:0 forKey:@"todayCollectedEnergy"];
-        [defaults setObject:today forKey:@"todayCollectedEnergyDate"];
+        [defaults setInteger:0 forKey:afCurrentAccountScopedKey(@"todayCollectedEnergy")];
+        [defaults setObject:today forKey:afCurrentAccountScopedKey(@"todayCollectedEnergyDate")];
         if (savedDate.length) {
             [defaults removeObjectForKey:@"oceanLimitReachedToday"];
             [defaults removeObjectForKey:@"oceanCleanedFriendsToday"];
@@ -6035,9 +6091,106 @@ static NSInteger extractTaskBrowseSeconds(NSDictionary *baseInfo, NSDictionary *
 
 - (void)setMyUserId:(NSString *)myUserId {
     if (![myUserId isKindOfClass:NSString.class] || !myUserId.length) return;
+    NSString *previousUserId = _myUserId.length ? _myUserId : [[NSUserDefaults standardUserDefaults] stringForKey:@"lastKnownUserId"];
+    BOOL accountChanged = previousUserId.length && ![previousUserId isEqualToString:myUserId];
     _myUserId = [myUserId copy];
+    sAccountIdentityConfirmed = YES;
+    sLaunchIdentityWaitCount = 0;
     [[NSUserDefaults standardUserDefaults] setObject:_myUserId forKey:@"lastKnownUserId"];
     [[NSUserDefaults standardUserDefaults] synchronize];
+    if (accountChanged) [self handleAccountChangedFromUserId:previousUserId];
+}
+
+// 同一台设备切换支付宝账号时，旧账号的好友缓存、浇水计数、日志和当日次数都残留在
+// 同一个 App 容器里（NSUserDefaults 不区分账号）。这里在首次识别到新账号时做一次隔离：
+// 清掉上一个账号的运行态缓存，再载入当前账号自己的日志与能量统计，
+// 避免第二个账号误报"今日已浇满 3 次，已跳过"以及日志面板显示上一个账号的记录。
+- (void)handleAccountChangedFromUserId:(NSString *)previousUserId {
+    (void)previousUserId;
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    // 1) 终止上一个账号遗留的浇水任务
+    if (waterRunning) {
+        waterRunning = NO;
+        waterAwaitingHome = NO;
+        waterAwaitingLimit = NO;
+        waterAwaitingTransfer = NO;
+        waterRequestToken++;
+        waterQueue = nil;
+        waterCurrentUserId = nil;
+        waterCurrentBizNo = nil;
+        waterRunReason = nil;
+        collectAfterLaunchWater = NO;
+    }
+    // 2) 重置仅属于上一账号的运行时集合
+    waterLaunchAttempted = NO;
+    lastWaterScheduledMinute = nil;
+    if (recordedCollectedBubbles) [recordedCollectedBubbles removeAllObjects];
+    if (pendingCollectBubbles) [pendingCollectBubbles removeAllObjects];
+    if (takeLookVisitedFriends) [takeLookVisitedFriends removeAllObjects];
+    if (reviveQueue) [reviveQueue removeAllObjects];
+    if (reviveQueuedIds) [reviveQueuedIds removeAllObjects];
+    if (todayCollectedAnimalKeys) [todayCollectedAnimalKeys removeAllObjects];
+    if (lastAnimalCollectAttemptTimes) [lastAnimalCollectAttemptTimes removeAllObjects];
+    if (shieldReportedFriendsInRound) [shieldReportedFriendsInRound removeAllObjects];
+    if (sDoubleCollectCheckedUsers) [sDoubleCollectCheckedUsers removeAllObjects];
+    if (sShieldedFriendsExpireMs) [sShieldedFriendsExpireMs removeAllObjects];
+    // 停止上一个账号遗留的找能量扫描与每日任务缓存
+    takeLookRunning = NO;
+    takeLookWaitingForFriend = NO;
+    takeLookCurrentFriendId = nil;
+    takeLookRounds = 0;
+    takeLookPass = 0;
+    takeLookTotalRounds = 0;
+    rankScanPending = NO;
+    selfPriorityPending = NO;
+    gDailyTaskDate = nil;
+    if (gDailyCompletedTasks) [gDailyCompletedTasks removeAllObjects];
+    if (gDailyFailedTasks) [gDailyFailedTasks removeAllObjects];
+    if (gDailyLoggedClaimKeys) [gDailyLoggedClaimKeys removeAllObjects];
+    if (gFarmTaskRetryCounts) [gFarmTaskRetryCounts removeAllObjects];
+    if (gVitalityTaskRetryCounts) [gVitalityTaskRetryCounts removeAllObjects];
+    if (vitalityTaskQueue) [vitalityTaskQueue removeAllObjects];
+    vitalityTaskRunning = NO;
+    // 3) 清掉上一个账号落盘的好友/每日任务缓存，等待当前账号重新拉取
+    [self.friendsName removeAllObjects];
+    [self.friendsRank removeAllObjects];
+    [self.friendsBubbles removeAllObjects];
+    NSArray<NSString *> *legacyAccountKeys = @[
+        @"friendsName", @"friendsRank", @"friendsBubbles", @"cachedFriendsRank",
+        @"autoReviveDate", @"autoReviveCount", @"autoReviveLimitReachedToday", @"autoReviveSuccessFriendsToday",
+        @"oceanCleanedDate", @"oceanCleanedFriendsToday", @"oceanLimitReachedToday",
+        @"todayAnimalEnergyCollectedDate",
+        @"vitality_daily_completed", @"vitality_daily_failed", @"vitality_task_cache_date",
+        @"lastManorAnswerDate", @"lastManorSignDate",
+        @"antforest_lastManorFarmId", @"antforest_lastManorFoodStock", @"antforest_lastManorFoodStockLimit"
+    ];
+    for (NSString *key in legacyAccountKeys) [defaults removeObjectForKey:key];
+    self.lastManorFarmId = nil;
+    self.lastManorAnimalId = nil;
+    self.lastManorFoodStock = 0;
+    self.lastManorFoodStockLimit = 0;
+    self.lastManorManureCollectDate = nil;
+    // 4) 载入当前账号的日志与今日/累计能量统计
+    self.logRecord = [afLoadLogRecordsForUserId(_myUserId) mutableCopy] ?: [NSMutableArray array];
+    self.todayCollectedEnergy = [defaults integerForKey:afAccountScopedDefaultsKey(@"todayCollectedEnergy", _myUserId)];
+    self.totalCollectedEnergy = [defaults integerForKey:afAccountScopedDefaultsKey(@"totalCollectedEnergy", _myUserId)];
+    if (![defaults stringForKey:afAccountScopedDefaultsKey(@"todayCollectedEnergyDate", _myUserId)].length) {
+        self.todayCollectedEnergy = 0;
+    }
+    [defaults synchronize];
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"LogUpdated" object:nil];
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"WaterFriendListUpdated" object:nil];
+    [self recordStage:@"切换 · 检测到登录账号变更，已隔离上一账号的日志、好友缓存与浇水计数"];
+    // 本进程内刚切换账号时，森林首页可能已经用上一账号的缓存跑过一次"打开即浇水"。
+    // 账号确认后补跑一次，确保当前账号真正执行自己的浇水任务（waterLaunchAttempted 已重置）。
+    if (self.enableWaterOnLaunch) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            AntForestManager *manager = AntForestManager.sharedInstance;
+            if (manager.enableWaterOnLaunch && manager.jsBridge && !waterRunning) {
+                [manager startLaunchWateringThenCollect];
+            }
+        });
+    }
 }
 
 @synthesize lastManorFarmId = _lastManorFarmId;
@@ -7461,11 +7614,13 @@ static BOOL oceanPlanLoggedThisRound = NO;
             logSaveQueue = dispatch_queue_create("com.antforest.logsave", DISPATCH_QUEUE_SERIAL);
         });
         NSArray *copyLogs = [arrLog copy];
+        // 日志按账号分键保存：切换账号后只展示各自账号的运行日志
+        NSString *logKey = afCurrentAccountScopedKey(@"logRecord");
         dispatch_async(logSaveQueue, ^{
             @try {
                 NSData *data = [NSKeyedArchiver archivedDataWithRootObject:copyLogs requiringSecureCoding:NO error:nil];
                 if (data) {
-                    [[NSUserDefaults standardUserDefaults] setObject:data forKey:@"logRecord"];
+                    [[NSUserDefaults standardUserDefaults] setObject:data forKey:logKey];
                 }
             } @catch (NSException *e) {}
         });
@@ -7529,8 +7684,8 @@ static BOOL oceanPlanLoggedThisRound = NO;
         NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
         self.totalCollectedEnergy += energy.integerValue;
         self.todayCollectedEnergy += energy.integerValue;
-        [defaults setInteger:self.totalCollectedEnergy forKey:@"totalCollectedEnergy"];
-        [defaults setInteger:self.todayCollectedEnergy forKey:@"todayCollectedEnergy"];
+        [defaults setInteger:self.totalCollectedEnergy forKey:afCurrentAccountScopedKey(@"totalCollectedEnergy")];
+        [defaults setInteger:self.todayCollectedEnergy forKey:afCurrentAccountScopedKey(@"todayCollectedEnergy")];
         [defaults synchronize];
         BOOL isSelf = [userId isEqualToString:self.myUserId] || isAnimalEnergy;
         NSString *source = @"自己";
@@ -7916,8 +8071,8 @@ static BOOL oceanPlanLoggedThisRound = NO;
                     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
                     self.totalCollectedEnergy += collected;
                     self.todayCollectedEnergy += collected;
-                    [defaults setInteger:self.totalCollectedEnergy forKey:@"totalCollectedEnergy"];
-                    [defaults setInteger:self.todayCollectedEnergy forKey:@"todayCollectedEnergy"];
+                    [defaults setInteger:self.totalCollectedEnergy forKey:afCurrentAccountScopedKey(@"totalCollectedEnergy")];
+                    [defaults setInteger:self.todayCollectedEnergy forKey:afCurrentAccountScopedKey(@"todayCollectedEnergy")];
                     [defaults synchronize];
                     [self recordStage:[NSString stringWithFormat:@"收取 · 保护地巡护动物能量球已成功收取：%ldg（今日累计 %ldg）", (long)collected, (long)self.todayCollectedEnergy]];
                 } else if ([resResultCode isEqualToString:@"ENERGY_CAN_NOT_COLLECT"] || 
