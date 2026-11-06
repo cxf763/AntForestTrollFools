@@ -1,0 +1,48 @@
+name: Build AntForestPort dylib
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/build.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          make --version | head -n 1
+
+      - name: Build dylibs
+        run: |
+          make clean
+          make
+
+      - name: Verify output
+        run: |
+          ls -l build/
+          for f in build/*.dylib; do
+            echo "== $f"
+            file "$f"
+            lipo -info "$f"
+            shasum -a 256 "$f"
+          done
+
+      - name: Upload dylib artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: AntForestPort-dylibs
+          path: build/*.dylib
+          if-no-files-found: error
+          retention-days: 7
