@@ -7,6 +7,11 @@
 #import "antforest/AntForestManager.h"
 #import "antforest/StepSimulator.h"
 
+// 账号隔离：与 AntForestManager.m 中使用相同的键规则
+static NSString *afAccountScopedDefaultsKey(NSString *baseKey, NSString *userId) {
+    return userId.length ? [NSString stringWithFormat:@"%@_%@", baseKey, userId] : baseKey;
+}
+
 static void (*originalViewDidLoad)(id, SEL);
 static void (*originalViewDidAppear)(id, SEL, BOOL);
 static id (*originalTransformResponseData)(id, SEL, id);
@@ -2069,7 +2074,9 @@ static void installEarnEnergyCollector(id controller) {
     [alert addAction:[UIAlertAction actionWithTitle:@"仅清空运行日志（保留今日/累计克数）" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
         AntForestManager *manager = [AntForestManager sharedInstance];
         [manager.logRecord removeAllObjects];
-        [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"logRecord"];
+        NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+        [defaults removeObjectForKey:afAccountScopedDefaultsKey(@"logRecord", manager.myUserId)];
+        [defaults removeObjectForKey:@"logRecord"];
         [manager clearProbeLogs];
         [self refresh];
     }]];
@@ -2077,12 +2084,14 @@ static void installEarnEnergyCollector(id controller) {
     [alert addAction:[UIAlertAction actionWithTitle:@"清空日志并重置能量统计克数" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
         AntForestManager *manager = [AntForestManager sharedInstance];
         [manager.logRecord removeAllObjects];
-        [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"logRecord"];
+        NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+        [defaults removeObjectForKey:afAccountScopedDefaultsKey(@"logRecord", manager.myUserId)];
+        [defaults removeObjectForKey:@"logRecord"];
         [manager clearProbeLogs];
         manager.todayCollectedEnergy = 0;
         manager.totalCollectedEnergy = 0;
-        [[NSUserDefaults standardUserDefaults] setInteger:0 forKey:@"todayCollectedEnergy"];
-        [[NSUserDefaults standardUserDefaults] setInteger:0 forKey:@"totalCollectedEnergy"];
+        [defaults setInteger:0 forKey:afAccountScopedDefaultsKey(@"todayCollectedEnergy", manager.myUserId)];
+        [defaults setInteger:0 forKey:afAccountScopedDefaultsKey(@"totalCollectedEnergy", manager.myUserId)];
         [self refresh];
     }]];
     
@@ -2369,33 +2378,56 @@ static id unarchiveDataSafe(NSData *data, Class primaryClass) {
 static void initializeManager(void) {
     AntForestManager *manager = [AntForestManager sharedInstance];
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    NSString *accountUserId = [defaults stringForKey:@"lastKnownUserId"];
+    NSString *logKey = afAccountScopedDefaultsKey(@"logRecord", accountUserId);
+    NSString *todayEnergyKey = afAccountScopedDefaultsKey(@"todayCollectedEnergy", accountUserId);
+    NSString *todayEnergyDateKey = afAccountScopedDefaultsKey(@"todayCollectedEnergyDate", accountUserId);
+    NSString *totalEnergyKey = afAccountScopedDefaultsKey(@"totalCollectedEnergy", accountUserId);
     NSData *bubbles = [defaults objectForKey:@"friendsBubbles"];
     NSData *names = [defaults objectForKey:@"friendsName"];
-    NSData *logs = [defaults objectForKey:@"logRecord"];
+    NSData *legacyLogs = [defaults objectForKey:@"logRecord"];
+    NSData *logs = [defaults objectForKey:logKey];
     NSData *ranks = [defaults objectForKey:@"cachedFriendsRank"];
+    // 旧版本日志使用固定键 logRecord，升级后一次性迁移到当前账号的分键，避免第二个账号读到上一账号的日志
+    if (!logs && legacyLogs) {
+        logs = legacyLogs;
+        if (accountUserId.length) [defaults setObject:legacyLogs forKey:logKey];
+    }
+    if (legacyLogs && accountUserId.length) [defaults removeObjectForKey:@"logRecord"];
+    // 今日/累计能量的旧固定键同样迁移到当前账号，避免升级当天统计被重置
+    if (accountUserId.length && ![defaults objectForKey:totalEnergyKey] && [defaults objectForKey:@"totalCollectedEnergy"]) {
+        [defaults setInteger:[defaults integerForKey:@"totalCollectedEnergy"] forKey:totalEnergyKey];
+        [defaults removeObjectForKey:@"totalCollectedEnergy"];
+    }
+    if (accountUserId.length && ![defaults objectForKey:todayEnergyDateKey] && [defaults objectForKey:@"todayCollectedEnergyDate"]) {
+        [defaults setInteger:[defaults integerForKey:@"todayCollectedEnergy"] forKey:todayEnergyKey];
+        [defaults setObject:[defaults stringForKey:@"todayCollectedEnergyDate"] forKey:todayEnergyDateKey];
+        [defaults removeObjectForKey:@"todayCollectedEnergy"];
+        [defaults removeObjectForKey:@"todayCollectedEnergyDate"];
+    }
     manager.friendsBubbles = [unarchiveDataSafe(bubbles, NSDictionary.class) mutableCopy] ?: [NSMutableDictionary dictionary];
     manager.friendsName = [unarchiveDataSafe(names, NSDictionary.class) mutableCopy] ?: [NSMutableDictionary dictionary];
     manager.friendsRank = [unarchiveDataSafe(ranks, NSDictionary.class) mutableCopy] ?: [NSMutableDictionary dictionary];
     manager.logRecord = [unarchiveDataSafe(logs, NSArray.class) mutableCopy] ?: [NSMutableArray array];
-    manager.totalCollectedEnergy = [defaults integerForKey:@"totalCollectedEnergy"];
+    manager.totalCollectedEnergy = [defaults integerForKey:totalEnergyKey];
     if (manager.totalCollectedEnergy > 1000000) {
         manager.totalCollectedEnergy = 0;
-        [defaults setInteger:0 forKey:@"totalCollectedEnergy"];
+        [defaults setInteger:0 forKey:totalEnergyKey];
     }
     NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
     formatter.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
     formatter.dateFormat = @"yyyy-MM-dd";
     NSString *today = [formatter stringFromDate:NSDate.date];
-    if ([[defaults stringForKey:@"todayCollectedEnergyDate"] isEqualToString:today]) {
-        manager.todayCollectedEnergy = [defaults integerForKey:@"todayCollectedEnergy"];
+    if ([[defaults stringForKey:todayEnergyDateKey] isEqualToString:today]) {
+        manager.todayCollectedEnergy = [defaults integerForKey:todayEnergyKey];
         if (manager.todayCollectedEnergy > 50000) {
             manager.todayCollectedEnergy = 0;
-            [defaults setInteger:0 forKey:@"todayCollectedEnergy"];
+            [defaults setInteger:0 forKey:todayEnergyKey];
         }
     } else {
         manager.todayCollectedEnergy = 0;
-        [defaults setInteger:0 forKey:@"todayCollectedEnergy"];
-        [defaults setObject:today forKey:@"todayCollectedEnergyDate"];
+        [defaults setInteger:0 forKey:todayEnergyKey];
+        [defaults setObject:today forKey:todayEnergyDateKey];
         [defaults synchronize];
     }
     manager.enableAutoCollect = [defaults boolForKey:@"enableAutoCollect"];
